@@ -1,32 +1,19 @@
-# ============================================================
-# VENLA V0.1
-# MODEL SOURCE GENERATOR
-# ============================================================
-
-import os
-import textwrap
-
-REPO_DIR = "/content/venla_robot"
-VENLA_DIR = os.path.join(REPO_DIR, "venla")
-
-os.makedirs(VENLA_DIR, exist_ok=True)
-
-
-MODEL_CODE = r'''
 """
 VENLA V0.1
-Transformer Decoder-Only Language Model
+100M Parameter Decoder-Only Transformer
 
 Architecture:
-    Vocabulary : 32,768
-    Context    : 512
-    Embedding  : 768
-    Layers     : 9
-    Heads      : 12
-    MLP        : 3,584
+- Vocabulary : 32,768
+- Context    : 512
+- Embedding  : 768
+- Layers     : 9
+- Heads      : 12
+- MLP        : 3,584
 
 Target:
-    ~100M parameters
+~96.4M parameters
+
+Model ini dibuat untuk causal language modeling.
 """
 
 import math
@@ -37,19 +24,78 @@ import torch.nn.functional as F
 
 
 # ============================================================
-# MODEL CONFIGURATION
+# DEFAULT CONFIGURATION
 # ============================================================
 
-VOCAB_SIZE = 32768
-CONTEXT_LENGTH = 512
+DEFAULT_VOCAB_SIZE = 32768
+DEFAULT_CONTEXT_LENGTH = 512
+DEFAULT_EMBED_DIM = 768
+DEFAULT_NUM_LAYERS = 9
+DEFAULT_NUM_HEADS = 12
+DEFAULT_MLP_DIM = 3584
 
-EMBED_DIM = 768
-NUM_LAYERS = 9
-NUM_HEADS = 12
-MLP_DIM = 3584
+DEFAULT_DROPOUT = 0.0
 
-MODEL_NAME = "VENLA"
-MODEL_VERSION = "V0.1"
+
+# ============================================================
+# RMS NORMALIZATION
+# ============================================================
+
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization.
+
+    Lebih sederhana daripada LayerNorm:
+        y = x / RMS(x) * weight
+    """
+
+    def __init__(
+        self,
+        dim,
+        eps=1e-6,
+    ):
+
+        super().__init__()
+
+        self.eps = eps
+
+        self.weight = nn.Parameter(
+            torch.ones(dim)
+        )
+
+
+    def forward(
+        self,
+        x,
+    ):
+
+        original_dtype = x.dtype
+
+        x_float = x.float()
+
+        variance = (
+            x_float
+            .pow(2)
+            .mean(
+                dim=-1,
+                keepdim=True,
+            )
+        )
+
+        x_float = (
+            x_float
+            * torch.rsqrt(
+                variance
+                + self.eps
+            )
+        )
+
+        return (
+            self.weight
+            * x_float.to(
+                original_dtype
+            )
+        )
 
 
 # ============================================================
@@ -60,44 +106,79 @@ class CausalSelfAttention(nn.Module):
     """
     Multi-head causal self-attention.
 
-    Tokens can only attend to:
-        current token
-        previous tokens
-
-    Future tokens are masked.
+    Token hanya boleh melihat token sebelumnya
+    dan dirinya sendiri.
     """
 
     def __init__(
         self,
-        embed_dim=EMBED_DIM,
-        num_heads=NUM_HEADS,
-        context_length=CONTEXT_LENGTH,
+        embed_dim,
+        num_heads,
+        context_length,
+        dropout=0.0,
     ):
+
         super().__init__()
 
+
         if embed_dim % num_heads != 0:
+
             raise ValueError(
-                "embed_dim harus habis dibagi num_heads."
+                "embed_dim harus habis dibagi "
+                "num_heads."
             )
 
+
         self.embed_dim = embed_dim
+
         self.num_heads = num_heads
 
         self.head_dim = (
-            embed_dim // num_heads
+            embed_dim
+            // num_heads
         )
+
+        self.context_length = (
+            context_length
+        )
+
+
+        # ----------------------------------------------------
+        # QKV
+        # ----------------------------------------------------
 
         self.qkv = nn.Linear(
             embed_dim,
             embed_dim * 3,
+            bias=False,
         )
 
-        self.proj = nn.Linear(
+
+        # ----------------------------------------------------
+        # OUTPUT
+        # ----------------------------------------------------
+
+        self.out_proj = nn.Linear(
             embed_dim,
             embed_dim,
+            bias=False,
         )
 
-        causal_mask = torch.tril(
+
+        # ----------------------------------------------------
+        # DROPOUT
+        # ----------------------------------------------------
+
+        self.dropout = nn.Dropout(
+            dropout
+        )
+
+
+        # ----------------------------------------------------
+        # CAUSAL MASK
+        # ----------------------------------------------------
+
+        mask = torch.tril(
             torch.ones(
                 context_length,
                 context_length,
@@ -105,118 +186,275 @@ class CausalSelfAttention(nn.Module):
             )
         )
 
+
         self.register_buffer(
             "causal_mask",
-            causal_mask,
+            mask.view(
+                1,
+                1,
+                context_length,
+                context_length,
+            ),
             persistent=False,
         )
 
-    def forward(self, x):
-        """
-        x:
-            [batch, sequence, embedding]
-        """
 
-        batch_size, sequence_length, embed_dim = x.shape
+    def forward(
+        self,
+        x,
+    ):
 
-        qkv = self.qkv(x)
-
-        q, k, v = qkv.chunk(
-            3,
-            dim=-1,
+        batch_size, seq_len, _ = (
+            x.shape
         )
+
+
+        if seq_len > self.context_length:
+
+            raise ValueError(
+                "Sequence length "
+                f"{seq_len} melebihi "
+                f"context length "
+                f"{self.context_length}."
+            )
+
+
+        # ----------------------------------------------------
+        # QKV
+        # ----------------------------------------------------
+
+        qkv = self.qkv(
+            x
+        )
+
+
+        q, k, v = (
+            qkv
+            .chunk(
+                3,
+                dim=-1,
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # HEADS
+        # ----------------------------------------------------
 
         q = q.view(
             batch_size,
-            sequence_length,
+            seq_len,
             self.num_heads,
             self.head_dim,
-        ).transpose(1, 2)
+        ).transpose(
+            1,
+            2,
+        )
+
 
         k = k.view(
             batch_size,
-            sequence_length,
+            seq_len,
             self.num_heads,
             self.head_dim,
-        ).transpose(1, 2)
+        ).transpose(
+            1,
+            2,
+        )
+
 
         v = v.view(
             batch_size,
-            sequence_length,
+            seq_len,
             self.num_heads,
             self.head_dim,
-        ).transpose(1, 2)
-
-        attention_scores = (
-            q @ k.transpose(-2, -1)
-        ) / math.sqrt(
-            self.head_dim
-        )
-
-        mask = self.causal_mask[
-            :sequence_length,
-            :sequence_length,
-        ]
-
-        attention_scores = attention_scores.masked_fill(
-            ~mask,
-            float("-inf"),
-        )
-
-        attention_weights = F.softmax(
-            attention_scores,
-            dim=-1,
-        )
-
-        output = attention_weights @ v
-
-        output = output.transpose(
+        ).transpose(
             1,
             2,
-        ).contiguous()
-
-        output = output.view(
-            batch_size,
-            sequence_length,
-            embed_dim,
         )
 
-        return self.proj(output)
+
+        # ----------------------------------------------------
+        # ATTENTION
+        # ----------------------------------------------------
+
+        if hasattr(
+            F,
+            "scaled_dot_product_attention",
+        ):
+
+            output = (
+                F.scaled_dot_product_attention(
+
+                    q,
+
+                    k,
+
+                    v,
+
+                    attn_mask=None,
+
+                    dropout_p=(
+                        self.dropout.p
+                        if self.training
+                        else 0.0
+                    ),
+
+                    is_causal=True,
+                )
+            )
+
+        else:
+
+            scale = (
+                1.0
+                / math.sqrt(
+                    self.head_dim
+                )
+            )
+
+
+            attention_scores = (
+                torch.matmul(
+                    q,
+                    k.transpose(
+                        -2,
+                        -1,
+                    ),
+                )
+                * scale
+            )
+
+
+            mask = (
+                self.causal_mask[
+                    :,
+                    :,
+                    :seq_len,
+                    :seq_len,
+                ]
+            )
+
+
+            attention_scores = (
+                attention_scores.masked_fill(
+                    ~mask,
+                    torch.finfo(
+                        attention_scores.dtype
+                    ).min,
+                )
+            )
+
+
+            attention_weights = (
+                F.softmax(
+                    attention_scores,
+                    dim=-1,
+                )
+            )
+
+
+            attention_weights = (
+                self.dropout(
+                    attention_weights
+                )
+            )
+
+
+            output = torch.matmul(
+                attention_weights,
+                v,
+            )
+
+
+        # ----------------------------------------------------
+        # MERGE HEADS
+        # ----------------------------------------------------
+
+        output = (
+            output
+            .transpose(
+                1,
+                2,
+            )
+            .contiguous()
+            .view(
+                batch_size,
+                seq_len,
+                self.embed_dim,
+            )
+        )
+
+
+        output = self.out_proj(
+            output
+        )
+
+
+        return output
 
 
 # ============================================================
 # FEED FORWARD NETWORK
 # ============================================================
 
-class MLP(nn.Module):
+class FeedForward(nn.Module):
     """
-    Transformer feed-forward network.
+    MLP Transformer block.
+
+    Menggunakan GELU.
     """
 
     def __init__(
         self,
-        embed_dim=EMBED_DIM,
-        mlp_dim=MLP_DIM,
+        embed_dim,
+        mlp_dim,
+        dropout=0.0,
     ):
+
         super().__init__()
+
 
         self.fc1 = nn.Linear(
             embed_dim,
             mlp_dim,
+            bias=False,
         )
+
 
         self.fc2 = nn.Linear(
             mlp_dim,
             embed_dim,
+            bias=False,
         )
 
-    def forward(self, x):
 
-        x = self.fc1(x)
+        self.dropout = nn.Dropout(
+            dropout
+        )
 
-        x = F.gelu(x)
 
-        x = self.fc2(x)
+    def forward(
+        self,
+        x,
+    ):
+
+        x = self.fc1(
+            x
+        )
+
+        x = F.gelu(
+            x,
+            approximate="tanh",
+        )
+
+        x = self.fc2(
+            x
+        )
+
+        x = self.dropout(
+            x
+        )
 
         return x
 
@@ -227,46 +465,97 @@ class MLP(nn.Module):
 
 class TransformerBlock(nn.Module):
     """
-    Pre-LN Transformer decoder block.
+    Pre-Norm Transformer block.
+
+        x
+        │
+        ├── RMSNorm
+        │
+        ├── Attention
+        │
+        └── Residual
+        │
+        ├── RMSNorm
+        │
+        ├── MLP
+        │
+        └── Residual
     """
 
     def __init__(
         self,
-        embed_dim=EMBED_DIM,
-        num_heads=NUM_HEADS,
-        mlp_dim=MLP_DIM,
-        context_length=CONTEXT_LENGTH,
+        embed_dim,
+        num_heads,
+        mlp_dim,
+        context_length,
+        dropout=0.0,
     ):
+
         super().__init__()
 
-        self.norm1 = nn.LayerNorm(
+
+        self.norm1 = RMSNorm(
             embed_dim
         )
 
-        self.attention = CausalSelfAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            context_length=context_length,
+
+        self.attention = (
+            CausalSelfAttention(
+
+                embed_dim=embed_dim,
+
+                num_heads=num_heads,
+
+                context_length=context_length,
+
+                dropout=dropout,
+            )
         )
 
-        self.norm2 = nn.LayerNorm(
+
+        self.norm2 = RMSNorm(
             embed_dim
         )
 
-        self.mlp = MLP(
+
+        self.mlp = FeedForward(
+
             embed_dim=embed_dim,
+
             mlp_dim=mlp_dim,
+
+            dropout=dropout,
         )
 
-    def forward(self, x):
 
-        x = x + self.attention(
-            self.norm1(x)
+    def forward(
+        self,
+        x,
+    ):
+
+        # ----------------------------------------------------
+        # ATTENTION
+        # ----------------------------------------------------
+
+        x = (
+            x
+            + self.attention(
+                self.norm1(x)
+            )
         )
 
-        x = x + self.mlp(
-            self.norm2(x)
+
+        # ----------------------------------------------------
+        # MLP
+        # ----------------------------------------------------
+
+        x = (
+            x
+            + self.mlp(
+                self.norm2(x)
+            )
         )
+
 
         return x
 
@@ -277,205 +566,396 @@ class TransformerBlock(nn.Module):
 
 class VENLA(nn.Module):
     """
-    VENLA V0.1 decoder-only language model.
+    VENLA V0.1.
 
-    Weight tying:
-        token embedding weights are reused
-        by the language-model output head.
+    Decoder-only Transformer
+    untuk causal language modeling.
     """
 
     def __init__(
         self,
-        vocab_size=VOCAB_SIZE,
-        context_length=CONTEXT_LENGTH,
-        embed_dim=EMBED_DIM,
-        num_layers=NUM_LAYERS,
-        num_heads=NUM_HEADS,
-        mlp_dim=MLP_DIM,
+        vocab_size=DEFAULT_VOCAB_SIZE,
+        context_length=DEFAULT_CONTEXT_LENGTH,
+        embed_dim=DEFAULT_EMBED_DIM,
+        num_layers=DEFAULT_NUM_LAYERS,
+        num_heads=DEFAULT_NUM_HEADS,
+        mlp_dim=DEFAULT_MLP_DIM,
+        dropout=DEFAULT_DROPOUT,
     ):
+
         super().__init__()
 
-        self.vocab_size = vocab_size
-        self.context_length = context_length
-        self.embed_dim = embed_dim
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.mlp_dim = mlp_dim
+
+        # ----------------------------------------------------
+        # CONFIG
+        # ----------------------------------------------------
+
+        self.vocab_size = (
+            vocab_size
+        )
+
+        self.context_length = (
+            context_length
+        )
+
+        self.embed_dim = (
+            embed_dim
+        )
+
+        self.num_layers = (
+            num_layers
+        )
+
+        self.num_heads = (
+            num_heads
+        )
+
+        self.mlp_dim = (
+            mlp_dim
+        )
+
+        self.dropout_rate = (
+            dropout
+        )
+
 
         # ----------------------------------------------------
         # TOKEN EMBEDDING
         # ----------------------------------------------------
 
-        self.token_embedding = nn.Embedding(
-            vocab_size,
-            embed_dim,
+        self.token_embedding = (
+            nn.Embedding(
+
+                vocab_size,
+
+                embed_dim,
+            )
         )
+
 
         # ----------------------------------------------------
         # POSITION EMBEDDING
         # ----------------------------------------------------
 
-        self.position_embedding = nn.Embedding(
-            context_length,
-            embed_dim,
+        self.position_embedding = (
+            nn.Embedding(
+
+                context_length,
+
+                embed_dim,
+            )
         )
 
+
         # ----------------------------------------------------
-        # TRANSFORMER BLOCKS
+        # EMBEDDING DROPOUT
         # ----------------------------------------------------
 
-        self.blocks = nn.ModuleList(
+        self.embedding_dropout = (
+            nn.Dropout(
+                dropout
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # TRANSFORMER
+        # ----------------------------------------------------
+
+        self.layers = nn.ModuleList(
+
             [
+
                 TransformerBlock(
+
                     embed_dim=embed_dim,
+
                     num_heads=num_heads,
+
                     mlp_dim=mlp_dim,
+
                     context_length=context_length,
+
+                    dropout=dropout,
                 )
-                for _ in range(num_layers)
+
+                for _ in range(
+                    num_layers
+                )
+
             ]
+
         )
+
 
         # ----------------------------------------------------
         # FINAL NORMALIZATION
         # ----------------------------------------------------
 
-        self.norm = nn.LayerNorm(
+        self.final_norm = RMSNorm(
             embed_dim
         )
 
+
         # ----------------------------------------------------
-        # WEIGHT INITIALIZATION
+        # LANGUAGE MODEL HEAD
         # ----------------------------------------------------
 
-        self._initialize_weights()
+        self.lm_head = nn.Linear(
 
-    def _initialize_weights(self):
+            embed_dim,
 
-        nn.init.normal_(
-            self.token_embedding.weight,
-            mean=0.0,
-            std=0.02,
+            vocab_size,
+
+            bias=False,
         )
 
-        nn.init.normal_(
-            self.position_embedding.weight,
-            mean=0.0,
-            std=0.02,
+
+        # ----------------------------------------------------
+        # WEIGHT TYING
+        # ----------------------------------------------------
+
+        self.lm_head.weight = (
+            self.token_embedding.weight
         )
 
-        for module in self.modules():
 
-            if isinstance(
-                module,
-                nn.Linear,
-            ):
+        # ----------------------------------------------------
+        # INITIALIZATION
+        # ----------------------------------------------------
 
-                nn.init.normal_(
-                    module.weight,
-                    mean=0.0,
-                    std=0.02,
-                )
+        self.apply(
+            self._init_weights
+        )
 
-                if module.bias is not None:
 
-                    nn.init.zeros_(
-                        module.bias
-                    )
+        # Re-apply tied weight after
+        # initialization.
+        self.lm_head.weight = (
+            self.token_embedding.weight
+        )
 
-            elif isinstance(
-                module,
-                nn.LayerNorm,
-            ):
 
-                nn.init.ones_(
-                    module.weight
-                )
+    # ========================================================
+    # INITIALIZATION
+    # ========================================================
+
+    def _init_weights(
+        self,
+        module,
+    ):
+
+        if isinstance(
+            module,
+            nn.Linear,
+        ):
+
+            nn.init.normal_(
+                module.weight,
+                mean=0.0,
+                std=0.02,
+            )
+
+
+            if module.bias is not None:
 
                 nn.init.zeros_(
                     module.bias
                 )
+
+
+        elif isinstance(
+            module,
+            nn.Embedding,
+        ):
+
+            nn.init.normal_(
+                module.weight,
+                mean=0.0,
+                std=0.02,
+            )
+
+
+    # ========================================================
+    # MODEL CONFIG
+    # ========================================================
+
+    def model_config(
+        self,
+    ):
+
+        return {
+
+            "model_name":
+                "VENLA",
+
+            "version":
+                "V0.1",
+
+            "architecture":
+                "decoder-only-transformer",
+
+            "vocab_size":
+                self.vocab_size,
+
+            "context_length":
+                self.context_length,
+
+            "embed_dim":
+                self.embed_dim,
+
+            "num_layers":
+                self.num_layers,
+
+            "num_heads":
+                self.num_heads,
+
+            "mlp_dim":
+                self.mlp_dim,
+
+            "dropout":
+                self.dropout_rate,
+
+            "parameters":
+                self.num_parameters(),
+        }
+
+
+    # ========================================================
+    # PARAMETER COUNT
+    # ========================================================
+
+    def num_parameters(
+        self,
+    ):
+
+        return sum(
+            parameter.numel()
+            for parameter
+            in self.parameters()
+        )
+
+
+    def num_trainable_parameters(
+        self,
+    ):
+
+        return sum(
+
+            parameter.numel()
+
+            for parameter
+            in self.parameters()
+
+            if parameter.requires_grad
+        )
+
+
+    # ========================================================
+    # FORWARD
+    # ========================================================
 
     def forward(
         self,
         input_ids,
         targets=None,
     ):
-        """
-        Parameters
-        ----------
-        input_ids:
-            Tensor [batch, sequence]
 
-        targets:
-            Tensor [batch, sequence]
+        if input_ids.dim() != 2:
 
-        Returns
-        -------
-        logits:
-            Tensor [batch, sequence, vocab]
+            raise ValueError(
+                "input_ids harus memiliki "
+                "shape [batch, sequence]."
+            )
 
-        loss:
-            Cross entropy loss or None
-        """
 
-        batch_size, sequence_length = (
+        batch_size, seq_len = (
             input_ids.shape
         )
 
-        if sequence_length > self.context_length:
+
+        if seq_len > self.context_length:
 
             raise ValueError(
-                f"Sequence length "
-                f"{sequence_length} melebihi "
+                "Sequence length "
+                f"{seq_len} melebihi "
                 f"context length "
                 f"{self.context_length}."
             )
 
+
         # ----------------------------------------------------
-        # POSITION IDS
+        # POSITIONS
         # ----------------------------------------------------
 
-        position_ids = torch.arange(
-            sequence_length,
+        positions = torch.arange(
+
+            seq_len,
+
             device=input_ids.device,
+
+        ).unsqueeze(
+            0
         )
 
+
         # ----------------------------------------------------
-        # EMBEDDINGS
+        # EMBEDDING
         # ----------------------------------------------------
+
+        token_embeddings = (
+            self.token_embedding(
+                input_ids
+            )
+        )
+
+
+        position_embeddings = (
+            self.position_embedding(
+                positions
+            )
+        )
+
 
         x = (
-            self.token_embedding(input_ids)
-            +
-            self.position_embedding(position_ids)
+            token_embeddings
+            + position_embeddings
         )
+
+
+        x = self.embedding_dropout(
+            x
+        )
+
 
         # ----------------------------------------------------
         # TRANSFORMER
         # ----------------------------------------------------
 
-        for block in self.blocks:
+        for layer in self.layers:
 
-            x = block(x)
+            x = layer(
+                x
+            )
 
-        # ----------------------------------------------------
-        # FINAL NORMALIZATION
-        # ----------------------------------------------------
-
-        x = self.norm(x)
 
         # ----------------------------------------------------
-        # LANGUAGE MODEL HEAD
-        #
-        # Weight tying:
-        # output projection uses token embedding matrix.
+        # FINAL NORM
         # ----------------------------------------------------
 
-        logits = F.linear(
-            x,
-            self.token_embedding.weight,
+        x = self.final_norm(
+            x
         )
+
+
+        # ----------------------------------------------------
+        # LOGITS
+        # ----------------------------------------------------
+
+        logits = self.lm_head(
+            x
+        )
+
 
         # ----------------------------------------------------
         # LOSS
@@ -483,147 +963,177 @@ class VENLA(nn.Module):
 
         loss = None
 
+
         if targets is not None:
 
             loss = F.cross_entropy(
+
                 logits.reshape(
                     -1,
                     self.vocab_size,
                 ),
+
                 targets.reshape(
-                    -1,
+                    -1
                 ),
+
             )
+
 
         return logits, loss
 
-    def parameter_count(self):
 
-        return sum(
-            parameter.numel()
-            for parameter in self.parameters()
-        )
+    # ========================================================
+    # GENERATION
+    # ========================================================
 
-    def trainable_parameter_count(self):
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids,
+        max_new_tokens=50,
+        temperature=1.0,
+        top_k=None,
+    ):
 
-        return sum(
-            parameter.numel()
-            for parameter in self.parameters()
-            if parameter.requires_grad
-        )
-
-    def model_config(self):
-
-        return {
-            "model_name": MODEL_NAME,
-            "version": MODEL_VERSION,
-            "architecture": "Transformer decoder-only",
-            "vocab_size": self.vocab_size,
-            "context_length": self.context_length,
-            "embed_dim": self.embed_dim,
-            "num_layers": self.num_layers,
-            "num_heads": self.num_heads,
-            "mlp_dim": self.mlp_dim,
-            "parameters": self.parameter_count(),
-            "trainable_parameters":
-                self.trainable_parameter_count(),
-            "weight_tying": True,
-        }
+        self.eval()
 
 
-# ============================================================
-# FACTORY
-# ============================================================
+        if input_ids.dim() == 1:
 
-def create_model(
-    device=None,
-):
-    """
-    Create VENLA V0.1.
-    """
+            input_ids = input_ids.unsqueeze(
+                0
+            )
 
-    model = VENLA()
 
-    if device is not None:
+        for _ in range(
+            max_new_tokens
+        ):
 
-        model = model.to(device)
+            # ------------------------------------------------
+            # CONTEXT WINDOW
+            # ------------------------------------------------
 
-    return model
+            input_context = (
+                input_ids[
+                    :,
+                    -self.context_length:
+                ]
+            )
+
+
+            # ------------------------------------------------
+            # FORWARD
+            # ------------------------------------------------
+
+            logits, _ = self(
+                input_context
+            )
+
+
+            logits = logits[
+                :,
+                -1,
+                :
+            ]
+
+
+            # ------------------------------------------------
+            # TEMPERATURE
+            # ------------------------------------------------
+
+            if temperature <= 0:
+
+                raise ValueError(
+                    "temperature harus > 0."
+                )
+
+
+            logits = (
+                logits
+                / temperature
+            )
+
+
+            # ------------------------------------------------
+            # TOP-K
+            # ------------------------------------------------
+
+            if top_k is not None:
+
+                top_k = min(
+                    int(top_k),
+                    logits.size(-1),
+                )
+
+
+                values, _ = torch.topk(
+                    logits,
+                    top_k,
+                )
+
+
+                minimum = values[
+                    :,
+                    -1,
+                    None
+                ]
+
+
+                logits = torch.where(
+
+                    logits < minimum,
+
+                    torch.full_like(
+                        logits,
+                        float("-inf"),
+                    ),
+
+                    logits,
+                )
+
+
+            # ------------------------------------------------
+            # PROBABILITY
+            # ------------------------------------------------
+
+            probabilities = F.softmax(
+                logits,
+                dim=-1,
+            )
+
+
+            # ------------------------------------------------
+            # SAMPLE
+            # ------------------------------------------------
+
+            next_token = (
+                torch.multinomial(
+                    probabilities,
+                    num_samples=1,
+                )
+            )
+
+
+            input_ids = torch.cat(
+
+                [
+                    input_ids,
+                    next_token,
+                ],
+
+                dim=1,
+            )
+
+
+        return input_ids
 
 
 # ============================================================
 # MODEL TEST
 # ============================================================
 
-def test_model(
-    device=None,
-    sequence_length=64,
-):
-    """
-    Basic forward test.
-    """
-
-    if device is None:
-
-        device = torch.device(
-            "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
-        )
-
-    model = create_model(
-        device=device
-    )
-
-    model.eval()
-
-    input_ids = torch.randint(
-        0,
-        VOCAB_SIZE,
-        (
-            1,
-            sequence_length,
-        ),
-        device=device,
-    )
-
-    targets = torch.randint(
-        0,
-        VOCAB_SIZE,
-        (
-            1,
-            sequence_length,
-        ),
-        device=device,
-    )
-
-    with torch.no_grad():
-
-        logits, loss = model(
-            input_ids,
-            targets,
-        )
-
-    return {
-        "model": model,
-        "input_shape":
-            tuple(input_ids.shape),
-        "logits_shape":
-            tuple(logits.shape),
-        "loss":
-            float(loss),
-        "parameters":
-            model.parameter_count(),
-    }
-
-
-if __name__ == "__main__":
-
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
+def test_model():
 
     print("=" * 60)
     print("VENLA V0.1 - MODEL TEST")
@@ -631,92 +1141,326 @@ if __name__ == "__main__":
 
     print()
 
+
+    device = (
+
+        torch.device("cuda")
+
+        if torch.cuda.is_available()
+
+        else torch.device("cpu")
+    )
+
+
     print(
         "Device:",
-        device,
+        device
     )
+
 
     if torch.cuda.is_available():
 
         print(
             "GPU:",
-            torch.cuda.get_device_name(0),
+            torch.cuda.get_device_name(0)
         )
 
-    model = create_model(
-        device=device
-    )
+
+        vram = (
+
+            torch.cuda.get_device_properties(
+                0
+            ).total_memory
+            / (
+                1024 ** 3
+            )
+        )
+
+
+        print(
+            "VRAM:",
+            f"{vram:.2f} GB"
+        )
+
 
     print()
+
+
+    # --------------------------------------------------------
+    # CREATE MODEL
+    # --------------------------------------------------------
 
     print(
-        "Parameters:",
-        f"{model.parameter_count():,}",
+        "Creating VENLA..."
     )
 
-    result = test_model(
-        device=device
+
+    model = VENLA()
+
+
+    model = model.to(
+        device
+    )
+
+
+    # --------------------------------------------------------
+    # INFORMATION
+    # --------------------------------------------------------
+
+    config = (
+        model.model_config()
+    )
+
+
+    print("=" * 60)
+    print("MODEL INFORMATION")
+    print("=" * 60)
+
+    print()
+
+
+    print(
+        "Vocabulary:",
+        config["vocab_size"]
+    )
+
+    print(
+        "Context:",
+        config["context_length"]
+    )
+
+    print(
+        "Embedding:",
+        config["embed_dim"]
+    )
+
+    print(
+        "Layers:",
+        config["num_layers"]
+    )
+
+    print(
+        "Heads:",
+        config["num_heads"]
+    )
+
+    print(
+        "MLP:",
+        config["mlp_dim"]
     )
 
     print()
+
+
+    parameters = (
+        model.num_parameters()
+    )
+
+
+    trainable = (
+        model.num_trainable_parameters()
+    )
+
+
+    print(
+        "Total parameters:",
+        f"{parameters:,}"
+    )
+
+    print(
+        "Trainable:",
+        f"{trainable:,}"
+    )
+
+
+    print()
+
+
+    # --------------------------------------------------------
+    # FORWARD
+    # --------------------------------------------------------
+
+    batch_size = 1
+
+    sequence_length = 64
+
+
+    input_ids = torch.randint(
+
+        0,
+
+        model.vocab_size,
+
+        (
+            batch_size,
+            sequence_length,
+        ),
+
+        device=device,
+
+    )
+
+
+    targets = torch.randint(
+
+        0,
+
+        model.vocab_size,
+
+        (
+            batch_size,
+            sequence_length,
+        ),
+
+        device=device,
+
+    )
+
+
+    print("=" * 60)
+    print("FORWARD TEST")
+    print("=" * 60)
+
+    print()
+
+
+    with torch.no_grad():
+
+        logits, loss = model(
+
+            input_ids,
+
+            targets,
+        )
+
 
     print(
         "Input shape:",
-        result["input_shape"],
+        tuple(
+            input_ids.shape
+        )
     )
+
 
     print(
         "Logits shape:",
-        result["logits_shape"],
+        tuple(
+            logits.shape
+        )
     )
+
 
     print(
         "Loss:",
-        result["loss"],
+        float(loss)
     )
+
+
+    print()
+
+
+    # --------------------------------------------------------
+    # GENERATION TEST
+    # --------------------------------------------------------
+
+    generated = model.generate(
+
+        input_ids[:, :8],
+
+        max_new_tokens=8,
+
+        temperature=1.0,
+
+        top_k=20,
+    )
+
+
+    print(
+        "Generation shape:",
+        tuple(
+            generated.shape
+        )
+    )
+
+
+    print(
+        "Generation test: OK"
+    )
+
+
+    # --------------------------------------------------------
+    # GPU MEMORY
+    # --------------------------------------------------------
+
+    if torch.cuda.is_available():
+
+        allocated = (
+            torch.cuda.memory_allocated()
+            / (
+                1024 ** 3
+            )
+        )
+
+
+        reserved = (
+            torch.cuda.memory_reserved()
+            / (
+                1024 ** 3
+            )
+        )
+
+
+        print()
+
+        print("=" * 60)
+        print("GPU MEMORY")
+        print("=" * 60)
+
+        print()
+
+        print(
+            "Allocated:",
+            f"{allocated:.3f} GB"
+        )
+
+        print(
+            "Reserved:",
+            f"{reserved:.3f} GB"
+        )
+
+
+    # --------------------------------------------------------
+    # ASSERT
+    # --------------------------------------------------------
+
+    assert logits.shape == (
+
+        batch_size,
+
+        sequence_length,
+
+        model.vocab_size,
+    )
+
+
+    assert loss is not None
+
+    assert math.isfinite(
+        float(loss)
+    )
+
 
     print()
 
     print("=" * 60)
-    print("VENLA MODEL TEST SELESAI")
+    print("✅ VENLA MODEL TEST BERHASIL")
     print("=" * 60)
-'''
 
 
-MODEL_PATH = os.path.join(
-    VENLA_DIR,
-    "model.py"
-)
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
+if __name__ == "__main__":
 
-with open(
-    MODEL_PATH,
-    "w",
-    encoding="utf-8"
-) as f:
-    f.write(MODEL_CODE)
-
-
-print("=" * 60)
-print("VENLA MODEL SOURCE CREATED")
-print("=" * 60)
-print()
-print("File:")
-print(MODEL_PATH)
-print()
-print("Size:")
-print(
-    os.path.getsize(MODEL_PATH),
-    "bytes"
-)
-print()
-print("Isi utama:")
-print("  VENLA V0.1")
-print("  Vocabulary : 32,768")
-print("  Context    : 512")
-print("  Embedding  : 768")
-print("  Layers     : 9")
-print("  Heads      : 12")
-print("  MLP        : 3,584")
-print()
-print("✅ model.py berhasil dibuat.")
+    test_model()
